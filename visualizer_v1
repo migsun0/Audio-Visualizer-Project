@@ -1,0 +1,863 @@
+#include <io.h>
+#include <io.c>
+#include <bit.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <stdio.h>
+
+//=====Global variables=====
+unsigned char red_val = 0xFF; 
+unsigned char green_val = 0xFF;
+unsigned char blue_val = 0xFF;
+unsigned char column_sel = 0x00; // grounds column to display pattern
+unsigned long output = 0;
+unsigned char ctrlReset;
+unsigned char ctrlStrobe;
+unsigned short channel[7] = {0};
+unsigned char channel_count = 0;
+//=========================
+
+volatile unsigned char TimerFlag = 0; // TimerISR() sets this to 1. C programmer should clear to 0.
+
+// Internal variables for mapping AVR's ISR to our cleaner TimerISR model.
+unsigned long _avr_timer_M = 1; // Start count from here, down to 0. Default 1 ms.
+unsigned long _avr_timer_cntcurr = 0; // Current internal count of 1ms ticks
+
+void TimerOn() {
+	// AVR timer/counter controller register TCCR1
+	TCCR1B = 0x0B;// bit3 = 0: CTC mode (clear timer on compare)
+	// bit2bit1bit0=011: pre-scaler /64
+	// 00001011: 0x0B
+	// SO, 8 MHz clock or 8,000,000 /64 = 125,000 ticks/s
+	// Thus, TCNT1 register will count at 125,000 ticks/s
+
+	// AVR output compare register OCR1A.
+	OCR1A = 125;	// Timer interrupt will be generated when TCNT1==OCR1A
+	// We want a 1 ms tick. 0.001 s * 125,000 ticks/s = 125
+	// So when TCNT1 register equals 125,
+	// 1 ms has passed. Thus, we compare to 125.
+	// AVR timer interrupt mask register
+	TIMSK1 = 0x02; // bit1: OCIE1A -- enables compare match interrupt
+
+	//Initialize avr counter
+	TCNT1=0;
+
+	_avr_timer_cntcurr = _avr_timer_M;
+	// TimerISR will be called every _avr_timer_cntcurr milliseconds
+
+	//Enable global interrupts
+	SREG |= 0x80; // 0x80: 1000000
+}
+
+void TimerOff() {
+	TCCR1B = 0x00; // bit3bit1bit0=000: timer off
+}
+
+void TimerISR() {
+	TimerFlag = 1;
+}
+
+// In our approach, the C programmer does not touch this ISR, but rather TimerISR()
+ISR(TIMER1_COMPA_vect) {
+	// CPU automatically calls when TCNT1 == OCR1 (every 1 ms per TimerOn settings)
+	_avr_timer_cntcurr--; // Count down to 0 rather than up to TOP
+	if (_avr_timer_cntcurr == 0) { // results in a more efficient compare
+		TimerISR(); // Call the ISR that the user uses
+		_avr_timer_cntcurr = _avr_timer_M;
+	}
+}
+
+// Set TimerISR() to tick every M ms
+void TimerSet(unsigned long M) {
+	_avr_timer_M = M;
+	_avr_timer_cntcurr = _avr_timer_M;
+}
+
+void ADC_init() {
+	ADCSRA |= (1 << ADEN) | (1 << ADSC) | (1 << ADATE);
+	// ADEN: setting this bit enables analog-to-digital conversion.
+	// ADSC: setting this bit starts the first conversion.
+	// ADATE: setting this bit enables auto-triggering. Since we are
+	//        in Free Running Mode, a new conversion will trigger whenever
+	//        the previous conversion completes.
+}
+
+//=====Helper functions=====
+void transmit_data(unsigned long data) {
+	int i;
+	for (i = 0; i < 32 ; ++i) {
+		// Sets SRCLR to 1 allowing data to be set
+		// Also clears SRCLK in preparation of sending data
+		PORTD = 0x08;
+		// set SER = next bit of data to be sent.
+		PORTD |= ((data >> i) & 0x01);
+		// set SRCLK = 1. Rising edge shifts next bit of data into the shift register
+		PORTD |= 0x02;
+	}
+	// set RCLK = 1. Rising edge copies data from “Shift” register to “Storage” register
+	PORTD |= 0x04;
+	// clears all lines in preparation of a new transmission
+	PORTD = 0x00;
+}
+//=========================
+
+typedef struct task {
+	int state;
+	unsigned long int period;
+	unsigned long int elapsedTime;
+	int (*TickFct)(int);
+} task;
+
+task tasks[8];
+
+const unsigned char tasksNum = 8;
+const unsigned long tasksPeriodGCD = 1;
+const unsigned long periodReadTick = 1;
+const unsigned long periodDisplay = 1;
+
+//========SMS========
+//===================
+enum read_states{Init, read, store, high, low};
+int Read_Tick_Right(int state)
+{
+// MSGEQ7 bands = 63Hz, 160Hz, 400Hz, 1,000Hz, 2,500Hz, 6,250Hz, 16,000Hz
+	switch(state)
+	{
+		case Init:
+		state = high;
+		break;
+		
+		case high:
+		state = low;
+		break;
+		
+		case low:
+		state = read;
+		break;
+		
+		case read:
+		state = store;
+		break;
+		
+		case store:
+		if(channel_count < 7)
+		{
+			state = read;
+		}
+		else
+		{
+			state = Init;
+		}
+		break;
+	}
+	switch(state)
+	{
+		case Init:
+		channel_count = 0;
+		break;
+		
+		case high:
+		ctrlReset = 0x00; //low
+		ctrlStrobe = 0x02; //high
+		ctrlReset = 0x01; //high
+		break;
+		
+		case low:
+		ctrlReset = 0x00; //low
+		break;
+		
+		case read:
+		ctrlStrobe = 0x00;
+		break;
+		
+		case store:
+		channel[channel_count] = ADC;
+		ctrlStrobe = 0x02;
+		++channel_count;
+		break;
+	}
+	PORTC = ctrlStrobe | ctrlReset;
+	return state;
+}
+
+enum CH0_States {sm0_display};
+int writeChannel0(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm0_display: break;
+		default: state = sm0_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm0_display:
+		if(channel[0] <= 1024 && channel[0] >= 896)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[0] <= 895 && channel[0] >= 768)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[0] <= 767 && channel[0] >= 640)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[0] <= 639 && channel[0] >= 512)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[0] <= 511 && channel[0] >= 384)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[0] <= 383 && channel[0] >= 256)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[0] <= 255 && channel[0] >= 128)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[0] <= 127 && channel[0] >= 100)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[0] <= 100 && channel[0] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0x7F;//0111 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+		
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+		
+	transmit_data(output);
+	return state;
+};
+
+enum CH1_States {sm1_display};
+int writeChannel1(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm1_display: break;
+		default: state = sm1_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm1_display:
+		if(channel[1] <= 1024 && channel[1] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[1] <= 904 && channel[1] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[1] <= 904 && channel[1] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[1] <= 785 && channel[1] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[1] <= 666 && channel[1] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[1] <= 548 && channel[1] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[1] <= 428 && channel[1] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[1] <= 309 && channel[1] >= 191)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[1] <= 190 && channel[1] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xBF;//1011 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+
+enum CH2_States {sm2_display};
+int writeChannel2(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm2_display: break;
+		default: state = sm2_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm2_display:
+		if(channel[2] <= 1024 && channel[2] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[2] <= 904 && channel[2] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[2] <= 904 && channel[2] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[2] <= 785 && channel[2] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[2] <= 666 && channel[2] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[2] <= 548 && channel[2] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[2] <= 428 && channel[2] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[2] <= 309 && channel[2] >= 198)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[2] <= 199 && channel[2] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xDF;//1101 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+
+enum CH3_States {sm3_display};
+int writeChannel3(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm3_display: break;
+		default: state = sm3_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm3_display:
+		if(channel[3] <= 1024 && channel[3] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[3] <= 904 && channel[3] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[3] <= 904 && channel[3] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[3] <= 785 && channel[3] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[3] <= 666 && channel[3] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[3] <= 548 && channel[3] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[3] <= 428 && channel[3] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[3] <= 309 && channel[3] >= 191)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[3] <= 190 && channel[3] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xEF;//1110 1111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+
+enum CH4_States {sm4_display};
+int writeChannel4(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm4_display: break;
+		default: state = sm4_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm4_display:
+		if(channel[4] <= 1024 && channel[4] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[4] <= 904 && channel[4] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[4] <= 904 && channel[4] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[4] <= 785 && channel[4] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[4] <= 666 && channel[4] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[4] <= 548 && channel[4] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[4] <= 428 && channel[4] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[4] <= 309 && channel[4] >= 191)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[4] <= 190 && channel[4] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xF7;//1111 0111
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+
+enum CH5_States {sm5_display};
+int writeChannel5(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm5_display: break;
+		default: state = sm5_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm5_display:
+		if(channel[5] <= 1024 && channel[5] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[5] <= 904 && channel[5] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[5] <= 904 && channel[5] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[5] <= 785 && channel[5] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[5] <= 666 && channel[5] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[5] <= 548 && channel[5] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[5] <= 428 && channel[5] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[5] <= 309 && channel[5] >= 191)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[5] <= 190 && channel[5] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFB;//1111 1011
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+
+enum CH6_States {sm6_display};
+int writeChannel6(int state) {
+	// === Transitions ===
+	switch (state) {
+		case sm6_display: break;
+		default: state = sm6_display;
+		break;
+	}
+
+	// === Actions ===
+	//colors are vertical values
+	switch (state) {
+		case sm6_display:
+		if(channel[6] <= 1024 && channel[6] >= 905)
+		{
+			red_val = 0xFF; //1111 1111
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; // 1111 1111
+			column_sel = 0xFF; //1111 1111
+		}
+		else if(channel[6] <= 904 && channel[6] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1110
+			column_sel = 0xFE; //1111 1110
+		}
+		else if(channel[6] <= 904 && channel[6] >= 786)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xFC; //1111 1100
+		}
+		else if(channel[6] <= 785 && channel[6] >= 667)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF8; //1111 1000
+		}
+		else if(channel[6] <= 666 && channel[6] >= 549)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xF0; //1111 0000
+		}
+		else if(channel[6] <= 548 && channel[6] >= 429)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xE0; //1110 0000
+		}
+		else if(channel[6] <= 428 && channel[6] >= 310)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0xC0; //1100 0000
+		}
+		else if(channel[6] <= 309 && channel[6] >= 191)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x80; //1000 0000
+		}
+		else if(channel[6] <= 190 && channel[6] >= 0)
+		{
+			red_val = 0xFF; //1000 0000
+			green_val = 0xFD;//1111 1101
+			blue_val = 0xFF; //1111 1111
+			column_sel = 0x00; //0000 0000
+		}
+		break;
+		default: break;
+	}
+	
+	output = ((unsigned long)column_sel << 24 | (unsigned long)green_val << 16);
+	output |= ((unsigned long)blue_val << 8 | (unsigned long)red_val);
+	
+	transmit_data(output);
+	return state;
+};
+//==============================
+
+int main()
+{
+	DDRB = 0xFF; // Set port B to output
+	PORTB = 0x00; // Init port B to 0s
+	DDRD = 0xFF; PORTD = 0x00;
+	DDRC = 0xFF; PORTC = 0x00;
+	
+	ADC_init();//initializes ADC
+	
+	unsigned char i = 0;
+	
+	//=======Task initialization========
+	tasks[i].state = Init;
+	tasks[i].period = periodReadTick;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &Read_Tick_Right;
+	++i;
+	tasks[i].state = sm0_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel0;
+	++i;
+	tasks[i].state = sm1_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel1;
+	++i;
+	tasks[i].state = sm2_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel2;
+	++i;
+	tasks[i].state = sm3_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel3;
+	++i;
+	tasks[i].state = sm4_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel4;
+	++i;
+	tasks[i].state = sm5_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel5;
+	++i;
+	tasks[i].state = sm6_display;
+	tasks[i].period = periodDisplay;
+	tasks[i].elapsedTime = tasks[i].period;
+	tasks[i].TickFct = &writeChannel6;
+	//==================================
+	
+	TimerSet(1);
+	TimerOn();
+	
+	while(1) {
+		unsigned char i;
+		for (i = 0; i < tasksNum; ++i) { // Heart of the scheduler code
+			if ( tasks[i].elapsedTime >= tasks[i].period ) { // Ready
+				tasks[i].state = tasks[i].TickFct(tasks[i].state);
+				tasks[i].elapsedTime = 0;
+			}
+			tasks[i].elapsedTime += tasksPeriodGCD;
+		}
+		
+		while(!TimerFlag);
+		TimerFlag = 0;
+	}
+	return 0;
+}
